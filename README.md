@@ -3,7 +3,7 @@
 This script installs an email server on Void Linux with all the features 
 required in the modern web.
 
-Special thanks to [Luke Smith](https://alexscarter.com) for the majority of
+Special thanks to [Luke Smith](https://lukesmith.xyz) for the majority of
 this script which I have only modified to work on Void instead of Debian.
 
 To start, simply run
