@@ -2,7 +2,7 @@
 
 # BEFORE INSTALLING
 
-# Have a Debian or Ubuntu server with a static IP and DNS records (usually
+# Have a Void Linux machine with a static IP and DNS records (usually
 # A/AAAA) that point your domain name to it.
 
 # NOTE WHILE INSTALLING
@@ -15,16 +15,26 @@
 # More DNS records will be given to you to install. One of them will be
 # different for every installation and is uniquely generated on your machine.
 
+# (Optional) Set up an account with smtp2go.com if your void email server is on a home network where rDNS and PTR records can't be changed to mail.yourdomain.tld
+
 umask 0022
 
-install_packages="postfix postfix-pcre dovecot-imapd dovecot-pop3d dovecot-sieve opendkim opendkim-tools spamassassin spamc net-tools fail2ban bind9-host"
+install_packages="postfix pcre dovecot dovecot-plugin-pigeonhole opendkim spamassassin net-tools fail2ban bind iptables snooze"
 
-systemctl -q stop dovecot
-systemctl -q stop postfix
-apt-get purge ?config-files -y $install_packages
-apt-get install -y $install_packages
+sv stop dovecot
+sv stop postfix
+xbps-install -Syu
+xbps-install -y $install_packages
 
-domain="$(cat /etc/mailname)"
+# Get domain from user
+printf "Enter your domain: "
+read -r domain
+
+if [ -z "$domain" ]; then
+    echo "Error: domain cannot be empty"
+    exit 1
+fi
+
 subdom=${MAIL_SUBDOM:-mail}
 maildomain="$subdom.$domain"
 certdir="/etc/letsencrypt/live/$maildomain"
@@ -60,10 +70,14 @@ ipv4=$(host "$domain" | grep -m1 -Eo '([0-9]+\.){3}[0-9]+')
 ipv6=$(host "$domain" | grep "IPv6" | awk '{print $NF}')
 [ -z "$ipv6" ] && echo "\033[0;31mPlease point your domain ("$domain") to your server's ipv6 address." && exit 1
 
-# Open required mail ports
+# Open required mail ports and enable iptables if not already
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -i lo -j ACCEPT
 for port in 80 993 465 25 587 110 995; do
-	ufw allow "$port" 2>/dev/null
+	iptables -A INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null
 done
+mkdir -p /etc/iptables
+iptables-save > /etc/iptables/iptables.rules
 
 if [ "$selfsigned" = "yes" ]; then
 	rm -f $certdir/privkey.pem
@@ -83,7 +97,8 @@ if [ "$selfsigned" = "yes" ]; then
 else
 
 	# Open port 80 for Certbot.
-	ufw allow 80 2>/dev/null
+	iptables -A INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null
+  iptables-save > /etc/iptables/iptables.rules
 
 	[ ! -d "$certdir" ] &&
 		possiblecert="$(certbot certificates 2>/dev/null | grep "Domains:\.* \(\*\.$domain\|$maildomain\)\(\s\|$\)" -A 2 | awk '/Certificate Path/ {print $3}' | head -n1)" &&
@@ -93,15 +108,15 @@ else
 		certdir="/etc/letsencrypt/live/$maildomain" &&
 		case "$(netstat -tulpn | grep ":80\s")" in
 		*nginx*)
-			apt install -y python3-certbot-nginx
+			xbps-install -y certbot-nginx
 			certbot -d "$maildomain" certonly --nginx --register-unsafely-without-email --agree-tos
 			;;
 		*apache*)
-			apt install -y python3-certbot-apache
+			xbps-install -y certbot-apache
 			certbot -d "$maildomain" certonly --apache --register-unsafely-without-email --agree-tos
 			;;
 		*)
-			apt install -y python3-certbot
+			xbps-install -y certbot
 			certbot -d "$maildomain" certonly --standalone --register-unsafely-without-email --agree-tos
 			;;
 	esac
@@ -183,6 +198,14 @@ echo "/^Received:.*/     IGNORE
 # domain, they must be authenticated as that user
 echo "/^(.*)@$(sh -c "echo $domain | sed 's/\./\\\./'")$/   \${1}" > /etc/postfix/login_maps.pcre
 
+# Set up postfix hostname and DNS servers, a weird Void Linux quirk with postfix
+mkdir -p /var/spool/postfix/etc/
+echo "nameserver 8.8.8.8
+nameserver 1.1.1.1" >> /var/spool/postfix/etc/resolv.conf 
+cp /etc/hosts /var/spool/postfix/etc/ 
+chmod 644 /var/spool/postfix/etc/*
+chown root:root /var/spool/postfix/etc/*
+
 # master.cf
 echo "Configuring Postfix's master.cf..."
 
@@ -195,7 +218,6 @@ submission inet n       -       y       -       -       smtpd
   -o syslog_name=postfix/submission
   -o smtpd_tls_security_level=encrypt
   -o smtpd_tls_auth_only=yes
-  -o smtpd_enforce_tls=yes
   -o smtpd_client_restrictions=permit_sasl_authenticated,reject
   -o smtpd_sender_restrictions=reject_sender_login_mismatch
   -o smtpd_sender_login_maps=pcre:/etc/postfix/login_maps.pcre
@@ -205,7 +227,7 @@ smtps     inet  n       -       y       -       -       smtpd
   -o smtpd_tls_wrappermode=yes
   -o smtpd_sasl_auth_enable=yes
 spamassassin unix -     n       n       -       -       pipe
-  user=debian-spamd argv=/usr/bin/spamc -f -e /usr/sbin/sendmail -oi -f \${sender} \${recipient}" >> /etc/postfix/master.cf
+  user=spamd argv=/usr/bin/spamc -f -e /usr/sbin/sendmail -oi -f \${sender} \${recipient}" >> /etc/postfix/master.cf
 
 # By default, dovecot has a bunch of configs in /etc/dovecot/conf.d/ These
 # files have nice documentation if you want to read it, but it's a huge pain to
@@ -217,87 +239,105 @@ mv /etc/dovecot/dovecot.conf /etc/dovecot/dovecot.backup.conf
 echo "Creating Dovecot config..."
 
 echo "# Dovecot config
-# Note that in the dovecot conf, you can use:
-# %u for username
-# %n for the name in name@domain.tld
-# %d for the domain
-# %h the user's home directory
+dovecot_config_version = 2.4.0
+dovecot_storage_version = 2.4.0
 
 ssl = required
-ssl_cert = <$certdir/fullchain.pem
-ssl_key = <$certdir/privkey.pem
+ssl_server_cert_file = $certdir/fullchain.pem
+ssl_server_key_file = $certdir/privkey.pem
 ssl_min_protocol = TLSv1.2
-ssl_cipher_list = "'EECDH+ECDSA+AESGCM:EECDH+aRSA+AESGCM:EECDH+ECDSA+SHA256:EECDH+aRSA+SHA256:EECDH+ECDSA+SHA384:EECDH+ECDSA+SHA256:EECDH+aRSA+SHA384:EDH+aRSA+AESGCM:EDH+aRSA+SHA256:EDH+aRSA:EECDH:!aNULL:!eNULL:!MEDIUM:!LOW:!3DES:!MD5:!EXP:!PSK:!SRP:!DSS:!RC4:!SEED'"
-ssl_prefer_server_ciphers = yes
-ssl_dh = </usr/share/dovecot/dh.pem
+ssl_cipher_list = EECDH+ECDSA+AESGCM:EECDH+aRSA+AESGCM:EECDH+ECDSA+SHA256:EECDH+aRSA+SHA256:EECDH+ECDSA+SHA384:EECDH+ECDSA+SHA256:EECDH+aRSA+SHA384:EDH+aRSA+AESGCM:EDH+aRSA+SHA256:EDH+aRSA:EECDH:!aNULL:!eNULL:!MEDIUM:!LOW:!3DES:!MD5:!EXP:!PSK:!SRP:!DSS:!RC4:!SEED
+ssl_server_prefer_ciphers = server
+ssl_server_dh_file = /usr/share/dovecot/dh.pem
 auth_mechanisms = plain login
-auth_username_format = %n
+auth_username_format = %{user | username }
 
-protocols = \$protocols $allowed_protocols
+protocols = $allowed_protocols
 
 # Search for valid users in /etc/passwd
-userdb {
-	driver = passwd
+userdb users {
+  driver = passwd
 }
+
 #Fallback: Use plain old PAM to find user passwords
-passdb {
-	driver = pam
+passdb pam {
+  driver = pam
 }
 
 # Our mail for each user will be in ~/Mail, and the inbox will be ~/Mail/Inbox
 # The LAYOUT option is also important because otherwise, the boxes will be \`.Sent\` instead of \`Sent\`.
-mail_location = $mailbox_format:~/Mail:INBOX=~/Mail/Inbox:LAYOUT=fs
+mailbox_list_layout = fs
+mail_driver = maildir
+mail_path = ~/Mail
+mail_inbox_path = ~/Mail/Inbox
+
 namespace inbox {
-	inbox = yes
-	mailbox Drafts {
-	special_use = \\Drafts
-	auto = subscribe
-}
-	mailbox Junk {
-	special_use = \\Junk
-	auto = subscribe
-	autoexpunge = 30d
-}
-	mailbox Sent {
-	special_use = \\Sent
-	auto = subscribe
-}
-	mailbox Trash {
-	special_use = \\Trash
-}
-	mailbox Archive {
-	special_use = \\Archive
-}
+  inbox = yes
+
+  mailbox Drafts {
+    special_use = \Drafts
+    auto = subscribe
+  }
+
+  mailbox Junk {
+    special_use = \Junk
+    auto = subscribe
+    autoexpunge = 30d
+  }
+
+  mailbox Sent {
+    special_use = \Sent
+    auto = subscribe
+  }
+
+  mailbox Trash {
+    special_use = \Trash
+  }
+
+  mailbox Archive {
+    special_use = \Archive
+  }
 }
 
 # Here we let Postfix use Dovecot's authentication system.
 service auth {
   unix_listener /var/spool/postfix/private/auth {
-	mode = 0660
-	user = postfix
-	group = postfix
+  mode = 0660
+  user = postfix
+  group = postfix
 }
 }
 
 protocol lda {
-  mail_plugins = \$mail_plugins sieve
+  mail_plugins = sieve
 }
 
 protocol lmtp {
-  mail_plugins = \$mail_plugins sieve
+  mail_plugins = sieve
 }
 
 protocol pop3 {
-  pop3_uidl_format = %08Xu%08Xv
+  pop3_uidl_format = %{uid | hex(8)}%{uidvalidity | hex(8)}
   pop3_no_flag_updates = yes
 }
 
-plugin {
-	sieve = ~/.dovecot.sieve
-	sieve_default = /var/lib/dovecot/sieve/default.sieve
-	#sieve_global_path = /var/lib/dovecot/sieve/default.sieve
-	sieve_dir = ~/.sieve
-	sieve_global_dir = /var/lib/dovecot/sieve/
+
+sieve_script personal {
+  driver = file
+  type = personal
+  path = ~/.sieve
+  active_path = ~/.dovecot.sieve
+}
+
+sieve_script default {
+    type = default
+    driver = file
+    path = /var/lib/dovecot/sieve/default.sieve
+}
+
+sieve_script global {
+  type = global
+  path = /var/lib/dovecot/sieve/
 }
 " > /etc/dovecot/dovecot.conf
 
@@ -363,9 +403,6 @@ sed -i '/^#Canonicalization/s/^#//' /etc/opendkim.conf
 sed -i '/Socket/s/^#*/#/' /etc/opendkim.conf
 grep -q '^Socket\s*inet:12301@localhost' /etc/opendkim.conf || echo 'Socket inet:12301@localhost' >> /etc/opendkim.conf
 
-# OpenDKIM daemon settings, removing previously activated socket.
-sed -i '/^SOCKET/d' /etc/default/opendkim && echo "SOCKET=\"inet:12301@localhost\"" >> /etc/default/opendkim
-
 # Here we add to postconf the needed settings for working with OpenDKIM
 echo 'Configuring Postfix with OpenDKIM settings...'
 postconf -e 'smtpd_sasl_security_options = noanonymous, noplaintext'
@@ -375,49 +412,54 @@ postconf -e 'milter_default_action = accept'
 postconf -e 'milter_protocol = 6'
 postconf -e 'smtpd_milters = inet:localhost:12301'
 postconf -e 'non_smtpd_milters = inet:localhost:12301'
-postconf -e 'mailbox_command = /usr/lib/dovecot/deliver'
+postconf -e 'mailbox_command = /usr/libexec/dovecot/deliver' # the path on void linux
 
 # Long-term fix to prevent SMTP smuggling
 postconf -e 'smtpd_forbid_bare_newline = normalize'
 postconf -e 'smtpd_forbid_bare_newline_exclusions = $mynetworks'
 
-# A fix for "Opendkim won't start: can't open PID file?", as specified here: https://serverfault.com/a/847442
-/lib/opendkim/opendkim.service.generate
-systemctl daemon-reload
-
 # Enable fail2ban security for dovecot and postfix.
-[ ! -f /etc/fail2ban/jail.d/emailwiz.local ] && echo "[postfix]
+echo "[postfix]
 enabled = true
+logpath = /var/log/socklog/mail/current
+
 [postfix-sasl]
 enabled = true
+logpath = /var/log/socklog/mail/current
+maxretry = 3
+bantime = 24h
+
 [sieve]
 enabled = true
+logpath = /var/log/socklog/mail/current
+
 [dovecot]
-enabled = true" > /etc/fail2ban/jail.d/emailwiz.local
+enabled = true
+logpath = /var/log/socklog/mail/current
+maxretry = 3
+bantime = 24h
+"> /etc/fail2ban/jail.local
 
-sed -i "s|^backend = auto$|backend = systemd|" /etc/fail2ban/jail.conf
+sed -i "s|^backend = auto$|backend = auto|" /etc/fail2ban/jail.conf
 
-# Enable SpamAssassin update cronjob.
-if [ -f /etc/default/spamassassin ]
-then
-	sed -i "s|^CRON=0|CRON=1|" /etc/default/spamassassin
-	printf "Restarting spamassassin..."
-	service spamassassin restart && printf " ...done\\n"
-	systemctl enable spamassassin
-elif [ -f /etc/default/spamd ]
-then
-	sed -i "s|^CRON=0|CRON=1|" /etc/default/spamd
-	printf "Restarting spamd..."
-	service spamd restart && printf " ...done\\n"
-	systemctl enable spamd
-else
-	printf "!!! Neither /etc/default/spamassassin or /etc/default/spamd exists, this is unexpected and needs to be investigated"
-fi
+# create a spamd user on Void, as it doesn't add on install
+groupadd -r spamd
+useradd -r -g spamd -s /usr/sbin/nologin -d /var/lib/spamassassin -c "spamd daemon" spamd
+mkdir -p /var/lib/spamassassin /var/log/spamassassin  # optional, for logs
+chown -R spamd:spamd /var/lib/spamassassin /var/log/spamassassin
 
-for x in opendkim dovecot postfix fail2ban; do
-	printf "Restarting %s..." "$x"
-	service "$x" restart && printf " ...done\\n"
-	systemctl enable "$x"
+# Create and Enable spamd service.
+mkdir -p /etc/sv/spamd 
+echo "#!/bin/sh
+[ -d /var/lib/spamassassin ] || sa-update
+exec spamd OPTS="-i 127.0.0.1 -p 783 -u spamd -g spamd -H /var/lib/spamassassin"
+" >> /etc/sv/spamd/run
+
+# Enable runit services
+for x in spamd opendkim dovecot postfix fail2ban iptables; do
+	printf "Starting %s..." "$x"
+	ln -s /etc/sv/"$x" /var/service && printf " ...done\\n"
+	sv start "$x"
 done
 
 pval="$(tr -d '\n' <"/etc/postfix/dkim/$domain/$subdom.txt" | sed "s/k=rsa.* \"p=/k=rsa; p=/;s/\"\s*\"//;s/\"\s*).*//" | grep -o 'p=.*')"
@@ -428,14 +470,14 @@ mxentry="$domain	MX	10	$maildomain	300"
 
 useradd -m -G mail postmaster
 
-# Create a cronjob that deletes month-old postmaster mails:
-cat <<EOF > /etc/cron.weekly/postmaster-clean
+# Create a monthly snooze task that deletes month-old postmaster mails:
+cat <<EOF > /etc/snooze-monthly/run
 #!/bin/sh
-
+set -e
 find /home/postmaster/Mail -type f -mtime +30 -name '*.mail*' -delete >/dev/null 2>&1
-exit 0
 EOF
-chmod 755 /etc/cron.weekly/postmaster-clean
+ln -s /etc/sv/snooze-monthly /var/service
+sv start snooze-monthly
 
 grep -q '^deploy-hook = echo "$RENEWED_DOMAINS" | grep -q' /etc/letsencrypt/cli.ini ||
 	echo "

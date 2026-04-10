@@ -1,15 +1,21 @@
 #!/bin/sh
 
-domain="$1"
+while true; do
+    printf "Enter your domain, such as alexscarter.com: "
+    read -r domain
+    [ -n "$domain" ] && break
+    echo "Error: domain cannot be empty, please try again."
+done
 
 # Input validation to allow only valid domain characters
-if ! [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-    echo "Give a valid domain as an argument to add mail server for it. Only alphanumeric characters, dashes, and dots are allowed."
-    exit 1
-fi
-
+case "$domain" in
+    *[!a-zA-Z0-9.-]*)
+        echo "Invalid domain. Only alphanumeric characters, dashes, and dots are allowed."
+        exit 1
+        ;;
+esac
 subdom="mail"
-maildomain="mail.$(cat /etc/mailname)"
+maildomain="$subdom.$domain"
 
 # Add the domain to the valid postfix addresses
 grep -q "^mydestination.*$domain" /etc/postfix/main.cf ||
@@ -25,7 +31,7 @@ chmod -R g+r /etc/postfix/dkim/*
 echo "$subdom._domainkey.$domain $domain:$subdom:/etc/postfix/dkim/$domain/$subdom.private" >> /etc/postfix/dkim/keytable
 echo "*@$domain $subdom._domainkey.$domain" >> /etc/postfix/dkim/signingtable
 
-systemctl reload opendkim postfix
+sv restart opendkim postfix
 
 # Print out DKIM TXT entry
 pval="$(tr -d '\n' <"/etc/postfix/dkim/$domain/$subdom.txt" | sed "s/k=rsa.* \"p=/k=rsa; p=/;s/\"\s*\"//;s/\"\s*).*//" | grep -o 'p=.*')"
