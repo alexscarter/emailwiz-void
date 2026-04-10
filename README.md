@@ -169,7 +169,6 @@ Or visit [Luke's original script](https://github.com/LukeSmithxyz/emailwiz) to d
 Can't send or receive mail? Getting marked as spam? There are tools to double-check your DNS records and more:
 
 - Always check `tail -f /var/log/socklog/mail/current` first for specific errors.
-- This script creates a configuration file for Dovecot >= 2.4
 - [Check your DNS](https://intodns.com/)
 - [Test your TXT records via mail](https://appmaildev.com/en/dkim)
 - [Is your IP blacklisted?](https://mxtoolbox.com/blacklists.aspx)
